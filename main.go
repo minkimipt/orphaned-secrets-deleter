@@ -16,15 +16,18 @@ import (
 )
 
 func main() {
-	var kubeconfig string
+	var allNamespaces, dryRun bool
 	var namespace string
 
-	flag.StringVar(&kubeconfig, "kubeconfig", getDefaultKubeconfigPath(), "path to the kubeconfig file")
+	flag.BoolVar(&allNamespaces, "all", false, "Delete secrets in all namespaces with the label cloud.timescale.com/is-customer-resource=\"true\"")
+	flag.BoolVar(&dryRun, "dry-run", false, "Print messages without deleting secrets")
 	flag.StringVar(&namespace, "namespace", "", "namespace to clean up secrets")
 
 	flag.Parse()
-
-	if namespace == "" {
+	kubeconfig := filepath.Join(
+		os.Getenv("HOME"), ".kube", "config",
+	)
+	if namespace == "" && !allNamespaces {
 		fmt.Println("Please specify the namespace using the -namespace flag.")
 		os.Exit(1)
 	}
@@ -37,19 +40,44 @@ func main() {
 
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		fmt.Printf("Error creating Kubernetes client: %v\n", err)
+		fmt.Printf("Error creating kubernetes client: %v\n", err)
 		os.Exit(1)
 	}
 
-	if err := cleanupSecrets(clientset, namespace); err != nil {
-		fmt.Printf("Error cleaning up secrets: %v\n", err)
-		os.Exit(1)
+	if allNamespaces {
+		err := cleanupAllNamespaces(clientset, dryRun)
+		if err != nil {
+			fmt.Printf("Error cleaning up all namespaces: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		err := cleanupSecrets(clientset, namespace, dryRun)
+		if err != nil {
+			fmt.Printf("Error cleaning up namespace %s: %v\n", namespace, err)
+			os.Exit(1)
+		}
 	}
-
-	fmt.Println("Cleanup completed.")
 }
 
-func cleanupSecrets(clientset *kubernetes.Clientset, namespace string) error {
+func cleanupAllNamespaces(clientset *kubernetes.Clientset, dryRun bool) error {
+	namespaces, err := clientset.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{
+		LabelSelector: "cloud.timescale.com/is-customer-resource=true",
+	})
+	if err != nil {
+		return fmt.Errorf("error listing namespaces: %v", err)
+	}
+
+	for _, namespace := range namespaces.Items {
+		err := cleanupSecrets(clientset, namespace.Name, dryRun)
+		if err != nil {
+			fmt.Printf("Error cleaning up namespace %s: %v\n", namespace.Name, err)
+		}
+	}
+
+	return nil
+}
+
+func cleanupSecrets(clientset *kubernetes.Clientset, namespace string, dryRun bool) error {
 	secrets, err := clientset.CoreV1().Secrets(namespace).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("error listing secrets: %v", err)
@@ -58,8 +86,10 @@ func cleanupSecrets(clientset *kubernetes.Clientset, namespace string) error {
 	for _, secret := range secrets.Items {
 		if strings.HasSuffix(secret.Name, "-certificate") && isEmptyOwnerReference(secret) && !strings.Contains(secret.Name, "root") {
 			fmt.Printf("Deleting secret %s as it is not used by any pods\n", secret.Name)
-			if err := clientset.CoreV1().Secrets(namespace).Delete(context.TODO(), secret.Name, metav1.DeleteOptions{}); err != nil {
-				fmt.Printf("Error deleting secret %s: %v\n", secret.Name, err)
+			if !dryRun {
+				if err := clientset.CoreV1().Secrets(namespace).Delete(context.TODO(), secret.Name, metav1.DeleteOptions{}); err != nil {
+					fmt.Printf("Error deleting secret %s: %v\n", secret.Name, err)
+				}
 			}
 		}
 	}
