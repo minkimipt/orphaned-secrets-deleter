@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -68,6 +69,7 @@ func cleanupAllNamespaces(clientset *kubernetes.Clientset, dryRun bool) error {
 	}
 
 	for _, namespace := range namespaces.Items {
+		fmt.Printf("processing namespace %s\n", namespace.Name)
 		err := cleanupSecrets(clientset, namespace.Name, dryRun)
 		if err != nil {
 			fmt.Printf("Error cleaning up namespace %s: %v\n", namespace.Name, err)
@@ -83,14 +85,50 @@ func cleanupSecrets(clientset *kubernetes.Clientset, namespace string, dryRun bo
 		return fmt.Errorf("error listing secrets: %v", err)
 	}
 
-	for _, secret := range secrets.Items {
-		if strings.HasSuffix(secret.Name, "-certificate") && isEmptyOwnerReference(secret) && !strings.Contains(secret.Name, "root") {
-			fmt.Printf("Deleting secret %s as it is not used by any pods\n", secret.Name)
-			if !dryRun {
-				if err := clientset.CoreV1().Secrets(namespace).Delete(context.TODO(), secret.Name, metav1.DeleteOptions{}); err != nil {
-					fmt.Printf("Error deleting secret %s: %v\n", secret.Name, err)
+	// Use a channel to communicate between goroutines
+	secretChan := make(chan v1.Secret)
+	errChan := make(chan error)
+
+	// Use a WaitGroup to wait for all goroutines to finish
+	var wg sync.WaitGroup
+
+	// Launch 10 goroutines
+	numWorkers := 5
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for secret := range secretChan {
+				if strings.HasSuffix(secret.Name, "-certificate") && isEmptyOwnerReference(secret) && !strings.Contains(secret.Name, "root") {
+					fmt.Printf("Deleting secret %s as it is not used by any pods\n", secret.Name)
+					if !dryRun {
+						if err := clientset.CoreV1().Secrets(namespace).Delete(context.TODO(), secret.Name, metav1.DeleteOptions{}); err != nil {
+							errChan <- fmt.Errorf("Error deleting secret %s: %v\n", secret.Name, err)
+						}
+					}
 				}
 			}
+		}()
+	}
+
+	// Send secrets to the channel
+	go func() {
+		defer close(secretChan)
+		for _, secret := range secrets.Items {
+			secretChan <- secret
+		}
+	}()
+
+	// Wait for all goroutines to finish
+	go func() {
+		wg.Wait()
+		close(errChan)
+	}()
+
+	// Collect errors from goroutines
+	for err := range errChan {
+		if err != nil {
+			return err
 		}
 	}
 
