@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
@@ -38,31 +41,34 @@ func main() {
 		os.Exit(1)
 	}
 
-	secrets, err := clientset.CoreV1().Secrets(namespace).List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		fmt.Printf("Error listing secrets: %v\n", err)
+	if err := cleanupSecrets(clientset, namespace); err != nil {
+		fmt.Printf("Error cleaning up secrets: %v\n", err)
 		os.Exit(1)
 	}
 
-	for _, secret := range secrets.Items {
-		pods, err := clientset.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{
-			LabelSelector: fmt.Sprintf("secret=%s", secret.Name),
-		})
-		if err != nil {
-			fmt.Printf("Error listing pods: %v\n", err)
-			continue
-		}
+	fmt.Println("Cleanup completed.")
+}
 
-		if len(pods.Items) == 0 {
+func cleanupSecrets(clientset *kubernetes.Clientset, namespace string) error {
+	secrets, err := clientset.CoreV1().Secrets(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("error listing secrets: %v", err)
+	}
+
+	for _, secret := range secrets.Items {
+		if strings.HasSuffix(secret.Name, "-certificate") && isEmptyOwnerReference(secret) && !strings.Contains(secret.Name, "root") {
 			fmt.Printf("Deleting secret %s as it is not used by any pods\n", secret.Name)
-			err := clientset.CoreV1().Secrets(namespace).Delete(context.TODO(), secret.Name, metav1.DeleteOptions{})
-			if err != nil {
+			if err := clientset.CoreV1().Secrets(namespace).Delete(context.TODO(), secret.Name, metav1.DeleteOptions{}); err != nil {
 				fmt.Printf("Error deleting secret %s: %v\n", secret.Name, err)
 			}
 		}
 	}
 
-	fmt.Println("Cleanup completed.")
+	return nil
+}
+
+func isEmptyOwnerReference(secret v1.Secret) bool {
+	return len(secret.OwnerReferences) == 0
 }
 
 func getDefaultKubeconfigPath() string {
