@@ -26,25 +26,12 @@ func main() {
 	flag.StringVar(&namespace, "namespace", "", "namespace to clean up secrets")
 
 	flag.Parse()
-	kubeconfig := filepath.Join(
-		os.Getenv("HOME"), ".kube", "config",
-	)
 	if namespace == "" && !allNamespaces {
 		fmt.Println("Please specify the namespace using the -namespace flag.")
 		os.Exit(1)
 	}
 
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
-	if err != nil {
-		fmt.Printf("Error building kubeconfig: %v\n", err)
-		os.Exit(1)
-	}
-
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		fmt.Printf("Error creating kubernetes client: %v\n", err)
-		os.Exit(1)
-	}
+	var clientset *kubernetes.Clientset
 
 	// Check if running inside a Kubernetes cluster
 	if _, err := os.Stat("/var/run/secrets/kubernetes.io/serviceaccount/token"); err == nil {
@@ -141,6 +128,52 @@ func cleanupSecrets(clientset *kubernetes.Clientset, namespace string, dryRun bo
 					}
 				}
 			}
+			pods, err := clientset.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{})
+			if err != nil {
+				errChan <- fmt.Errorf("Error listing pods: %v\n", err)
+				return
+			}
+
+			// Extract the first part of the pod name
+			var podPrefixes []string
+			for _, pod := range pods.Items {
+				parts := strings.Split(pod.Name, "-an-")
+				if len(parts) == 2 && len(parts[0]) == 10 {
+					podPrefixes = append(podPrefixes, parts[0])
+				}
+			}
+
+			// List all services in the namespace
+			services, err := clientset.CoreV1().Services(namespace).List(context.TODO(), metav1.ListOptions{})
+			if err != nil {
+				errChan <- fmt.Errorf("Error listing services: %v\n", err)
+				return
+			}
+
+			// Delete services that don't have the first part of the pod name in their name
+			for _, service := range services.Items {
+				shouldDelete := true
+				for _, prefix := range podPrefixes {
+					if !strings.Contains(service.Name, "an-config") {
+						shouldDelete = false
+						break
+					}
+					if strings.Contains(service.Name, prefix) {
+						shouldDelete = false
+						break
+					}
+				}
+
+				if shouldDelete {
+					fmt.Printf("Deleting service %s as it is not associated with any relevant pods\n", service.Name)
+					if !dryRun {
+						if err := clientset.CoreV1().Services(namespace).Delete(context.TODO(), service.Name, metav1.DeleteOptions{}); err != nil {
+							errChan <- fmt.Errorf("Error deleting service %s: %v\n", service.Name, err)
+						}
+					}
+				}
+			}
+
 		}()
 	}
 
