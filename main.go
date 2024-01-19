@@ -12,6 +12,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 )
@@ -43,6 +44,38 @@ func main() {
 	if err != nil {
 		fmt.Printf("Error creating kubernetes client: %v\n", err)
 		os.Exit(1)
+	}
+
+	// Check if running inside a Kubernetes cluster
+	if _, err := os.Stat("/var/run/secrets/kubernetes.io/serviceaccount/token"); err == nil {
+		// Running inside a Kubernetes cluster, use in-cluster configuration
+		config, err := rest.InClusterConfig()
+		if err != nil {
+			fmt.Printf("Error building in-cluster kubeconfig: %v\n", err)
+			os.Exit(1)
+		}
+		// Use the config to create a Kubernetes client
+		clientset, err = kubernetes.NewForConfig(config)
+		if err != nil {
+			fmt.Printf("Error creating Kubernetes client: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		// Running outside a Kubernetes cluster, use kubeconfig file
+		kubeconfig := filepath.Join(
+			os.Getenv("HOME"), ".kube", "config",
+		)
+		config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+		if err != nil {
+			fmt.Printf("Error building kubeconfig: %v\n", err)
+			os.Exit(1)
+		}
+		// Use the config to create a Kubernetes client
+		clientset, err = kubernetes.NewForConfig(config)
+		if err != nil {
+			fmt.Printf("Error creating Kubernetes client: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	if allNamespaces {
