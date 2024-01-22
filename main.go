@@ -72,7 +72,12 @@ func main() {
 			os.Exit(1)
 		}
 	} else {
-		err := cleanupSecrets(clientset, namespace, dryRun)
+		pods, err := gatherPods(clientset, namespace)
+		if err != nil {
+			fmt.Printf("Error retrieving pods from namespace %s: %v\n", namespace, err)
+			os.Exit(1)
+		}
+		err = cleanupSecrets(clientset, pods, namespace, dryRun)
 		if err != nil {
 			fmt.Printf("Error cleaning up namespace %s: %v\n", namespace, err)
 			os.Exit(1)
@@ -81,6 +86,14 @@ func main() {
 }
 
 func cleanupAllNamespaces(clientset *kubernetes.Clientset, dryRun bool) error {
+
+	// Use a channel to communicate between goroutines
+	namespaceChan := make(chan v1.Namespace)
+	errChan := make(chan error)
+
+	// Use a WaitGroup to wait for all goroutines to finish
+	var wg sync.WaitGroup
+
 	namespaces, err := clientset.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{
 		LabelSelector: "cloud.timescale.com/is-customer-resource=true",
 	})
@@ -88,100 +101,35 @@ func cleanupAllNamespaces(clientset *kubernetes.Clientset, dryRun bool) error {
 		return fmt.Errorf("error listing namespaces: %v", err)
 	}
 
-	for _, namespace := range namespaces.Items {
-		fmt.Printf("processing namespace %s\n", namespace.Name)
-		err := cleanupSecrets(clientset, namespace.Name, dryRun)
-		if err != nil {
-			fmt.Printf("Error cleaning up namespace %s: %v\n", namespace.Name, err)
-		}
-	}
-
-	return nil
-}
-
-func cleanupSecrets(clientset *kubernetes.Clientset, namespace string, dryRun bool) error {
-	secrets, err := clientset.CoreV1().Secrets(namespace).List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("error listing secrets: %v", err)
-	}
-
-	// Use a channel to communicate between goroutines
-	secretChan := make(chan v1.Secret)
-	errChan := make(chan error)
-
-	// Use a WaitGroup to wait for all goroutines to finish
-	var wg sync.WaitGroup
-
-	// Launch 10 goroutines
-	numWorkers := 5
+	numWorkers := 15
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for secret := range secretChan {
-				if strings.HasSuffix(secret.Name, "-certificate") && isEmptyOwnerReference(secret) && !strings.Contains(secret.Name, "root") {
-					fmt.Printf("Deleting secret %s as it is not used by any pods\n", secret.Name)
-					if !dryRun {
-						if err := clientset.CoreV1().Secrets(namespace).Delete(context.TODO(), secret.Name, metav1.DeleteOptions{}); err != nil {
-							errChan <- fmt.Errorf("Error deleting secret %s: %v\n", secret.Name, err)
-						}
-					}
+			for namespace := range namespaceChan {
+				pods, err := gatherPods(clientset, namespace.Name)
+				if err != nil {
+					errChan <- err
+					return
 				}
+				errChan <- cleanupSecrets(clientset, pods, namespace.Name, dryRun)
+				errChan <- cleanupServices(clientset, pods, namespace.Name, dryRun)
 			}
-			pods, err := clientset.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{})
-			if err != nil {
-				errChan <- fmt.Errorf("Error listing pods: %v\n", err)
-				return
-			}
-
-			// Extract the first part of the pod name
-			var podPrefixes []string
-			for _, pod := range pods.Items {
-				parts := strings.Split(pod.Name, "-an-")
-				if len(parts) == 2 && len(parts[0]) == 10 {
-					podPrefixes = append(podPrefixes, parts[0])
-				}
-			}
-
-			// List all services in the namespace
-			services, err := clientset.CoreV1().Services(namespace).List(context.TODO(), metav1.ListOptions{})
-			if err != nil {
-				errChan <- fmt.Errorf("Error listing services: %v\n", err)
-				return
-			}
-
-			// Delete services that don't have the first part of the pod name in their name
-			for _, service := range services.Items {
-				shouldDelete := true
-				for _, prefix := range podPrefixes {
-					if !strings.Contains(service.Name, "an-config") {
-						shouldDelete = false
-						break
-					}
-					if strings.Contains(service.Name, prefix) {
-						shouldDelete = false
-						break
-					}
-				}
-
-				if shouldDelete {
-					fmt.Printf("Deleting service %s as it is not associated with any relevant pods\n", service.Name)
-					if !dryRun {
-						if err := clientset.CoreV1().Services(namespace).Delete(context.TODO(), service.Name, metav1.DeleteOptions{}); err != nil {
-							errChan <- fmt.Errorf("Error deleting service %s: %v\n", service.Name, err)
-						}
-					}
-				}
-			}
-
 		}()
 	}
 
-	// Send secrets to the channel
+	namespaces, err = clientset.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{
+		LabelSelector: "cloud.timescale.com/is-customer-resource=true",
+	})
+	if err != nil {
+		return fmt.Errorf("error listing namespaces: %v", err)
+	}
+
 	go func() {
-		defer close(secretChan)
-		for _, secret := range secrets.Items {
-			secretChan <- secret
+		defer close(namespaceChan)
+		for _, namespace := range namespaces.Items {
+			fmt.Printf("Cleaning up namespace %s\n", namespace.Name)
+			namespaceChan <- namespace
 		}
 	}()
 
@@ -195,6 +143,96 @@ func cleanupSecrets(clientset *kubernetes.Clientset, namespace string, dryRun bo
 	for err := range errChan {
 		if err != nil {
 			return err
+		}
+	}
+
+	return nil
+}
+
+func cleanupSecrets(clientset *kubernetes.Clientset, podPrefixes []string, namespace string, dryRun bool) error {
+	secrets, err := clientset.CoreV1().Secrets(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("error listing secrets: %v", err)
+	}
+
+	// Delete secrets that don't have the first part of the pod name in their name
+	for _, secret := range secrets.Items {
+		shouldDelete := true
+		if strings.Contains(secret.Name, "root") || strings.Contains(secret.Name, "default-token") {
+			shouldDelete = false
+			break
+		}
+		for _, prefix := range podPrefixes {
+			if !strings.Contains(secret.Name, "-certificate") {
+				shouldDelete = false
+				break
+			}
+			if strings.Contains(secret.Name, prefix) {
+				shouldDelete = false
+				break
+			}
+		}
+
+		if shouldDelete {
+			fmt.Printf("Deleting secret %s as it is not associated with any relevant pods\n", secret.Name)
+			if !dryRun {
+				if err := clientset.CoreV1().Secrets(namespace).Delete(context.TODO(), secret.Name, metav1.DeleteOptions{}); err != nil {
+					return fmt.Errorf("Error deleting secret %s: %v\n", secret.Name, err)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func gatherPods(clientset *kubernetes.Clientset, namespace string) ([]string, error) {
+	var podPrefixes []string
+
+	pods, err := clientset.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return podPrefixes, fmt.Errorf("Error listing pods: %v\n", err)
+	}
+
+	// Extract the first part of the pod name
+	for _, pod := range pods.Items {
+		parts := strings.Split(pod.Name, "-an-")
+		if len(parts) == 2 && len(parts[0]) == 10 {
+			podPrefixes = append(podPrefixes, parts[0])
+		}
+	}
+	return podPrefixes, nil
+}
+
+func cleanupServices(clientset *kubernetes.Clientset, podPrefixes []string, namespace string, dryRun bool) error {
+	// List all services in the namespace
+	services, err := clientset.CoreV1().Services(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("Error listing services: %v\n", err)
+	}
+
+	// Delete services that don't have the first part of the pod name in their name
+	for _, service := range services.Items {
+		shouldDelete := true
+		if strings.Contains(service.Name, "an-config") {
+			for _, prefix := range podPrefixes {
+				if strings.Contains(service.Name, prefix) {
+					shouldDelete = false
+					break
+				}
+			}
+		} else {
+			// If "an-config" is not present, do not delete the service
+			shouldDelete = false
+		}
+
+		if shouldDelete {
+			fmt.Printf("Deleting service %s as it is not associated with any relevant pods\n", service.Name)
+			if !dryRun {
+				if err := clientset.CoreV1().Services(namespace).Delete(context.TODO(), service.Name, metav1.DeleteOptions{}); err != nil {
+					return fmt.Errorf("Error deleting service %s: %v\n", service.Name, err)
+				}
+			}
 		}
 	}
 
