@@ -1,0 +1,60 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubectl-user
+
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubectl-role
+rules:
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["list", "get", "delete"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["list", "get", "delete"]
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["list", "get"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["list", "get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubectl-role-binding
+subjects:
+- kind: ServiceAccount
+  name: kubectl-user
+  namespace: default # Update with the namespace if needed
+roleRef:
+  kind: ClusterRole
+  name: kubectl-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubectl-container
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubectl-container
+  template:
+    metadata:
+      labels:
+        app: kubectl-container
+    spec:
+      serviceAccountName: kubectl-user
+      containers:
+      - name: kubectl-container
+        image: ubuntu # Specify the image with kubectl
+        command: ["sleep", "infinity"] # Keep the container running
